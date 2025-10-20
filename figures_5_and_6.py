@@ -29,6 +29,7 @@ def frange(x, y, jump):
     x += jump
 
 #folders = ["../Enero_datasets/dataset_sing_top/data/results_single_top/evalRes_NEW_Garr199905/EVALUATE/"]
+#Ubicación de las carpetas con las diferentes matrices de tráfico de validación de las diferentes topologías que queremos usar para comparar el rendimiento de los modelos entrenados LS, DRL,y ENERO
 folders = ["../Enero_datasets/dataset_sing_top/evalRes_NEW_EliBackbone/EVALUATE/","../Enero_datasets/dataset_sing_top/evalRes_NEW_Janetbackbone/EVALUATE/","../Enero_datasets/dataset_sing_top/evalRes_NEW_HurricaneElectric/EVALUATE/"]
 
 if __name__ == "__main__":
@@ -45,7 +46,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    differentiation_str = args.d[0]
+    differentiation_str = args.d[0] #Será SP_3top_15_B_NEW 
 
     drl_top1_uti = []
     ls_top1_uti = []
@@ -81,22 +82,25 @@ if __name__ == "__main__":
     dd_Hurricane = pd.DataFrame(columns=['DRL','LS','Enero','Topologies'])
 
     # Iterate over all topologies and evaluate our DRL agent on all TMs
+    #Recorremos las diferentes topologías sobre las que queremos evlauar el agente DLR
     for folder in folders:
+        #ENERO_datasets\dataset_sing_top\evalRes_NEW_EliBackbone\EVALUATE\SP_3top_15_B_NEW (similar para el resto de topologías)
         drl_eval_res_folder = folder+differentiation_str+'/'
+        #Se toma el nombre de la topología donde vamos a evaluar el modelo (EliBackbone, JanetBackbone o HurricaneElectric)
         topology_eval_name = folder.split('NEW_')[1].split('/')[0]
         for subdir, dirs, files in os.walk(drl_eval_res_folder):
             it = 0
-            for file in files:
+            for file in files: #Para cada una de las topologías evaluadas...
                 if file.endswith((".pckl")):
                     results = []
                     path_to_pckl_rewards = drl_eval_res_folder + topology_eval_name + '/'
                     with open(path_to_pckl_rewards+file, 'rb') as f:
                         results = pickle.load(f)
                     if folder==folders[0]:
-                        dd_Eli.loc[it] = [results[9],results[7],results[3],topology_eval_name]
-                        cost_ls_top1.append(results[15])
-                        cost_drl_top1.append(results[14])
-                        cost_enero_top1.append(results[16])
+                        dd_Eli.loc[it] = [results[9],results[7],results[3],topology_eval_name] #Metrica aplicando sólo el agente, sólo LS, o ENERO, respectivamente
+                        cost_ls_top1.append(results[15]) #Tiempo ejecución de usar solo LS
+                        cost_drl_top1.append(results[14]) #Tiempo ejecución de usar sólo el agente DRL
+                        cost_enero_top1.append(results[16]) #Tiempo ejecución de usar ENERO (agente DRL, y luego LS)
                     elif folder==folders[1]:
                         dd_Janet.loc[it] = [results[9],results[7],results[3],topology_eval_name]
                         cost_ls_top2.append(results[15])

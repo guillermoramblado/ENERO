@@ -21,10 +21,21 @@ class Defo_results:
     MP_matrix = None
     ecmp_routing_matrix = None
     routing_matrix = None
-    links_bw = None
+    #Diccionario que mantiene como clave cada enlace dirigido [origen][destino], y como valor, su capacidad
+    links_bw = None 
+    #Diccionario que mantiene como clave cada enlace dirigido [origen][destino], y como valor, su peso (todos los enlaces tienen el mismo peso)
     links_weight = None
     Gbase = None
-    node_to_index_dic_pvt = None
+    '''
+    Diccionario que mantiene:
+        * CLAVE --> Etiqueta del nodo en el .graph (por ejemplo, N14)
+        * VALOR --> Posición dentro del MultiDiGraph de la librería Networkx (es decir, posición dentro del grafo a nivel de código)
+    '''
+    node_to_index_dic_pvt = None 
+    '''
+    Lo siguiente es una lista que nos permite lo contrario que lo anterior: Obtener la etiqueta del nodo en el .graph a partir de su posición en el MultiDiGraph (grafo interno en código)
+    inex_to_node_lst_pvt[14] --> almacena N14
+    '''
     index_to_node_lst_pvt = None
     pre_optim_max_load_link = None
     post_optim_max_load_link = None
@@ -56,13 +67,13 @@ class Defo_results:
         with open(self.graph_file) as fd:
             line = fd.readline()
             camps = line.split(" ")
-            self.net_size = int(camps[1])
+            self.net_size = int(camps[1]) #Nº de nodos de la red
             # Remove : label x y
             line = fd.readline()
             
-            for i in range (self.net_size):
+            for i in range (self.net_size): #Para cada uno de los nodos..
                 line = fd.readline()
-                node = line[0:line.find(" ")]
+                node = line[0:line.find(" ")] #Etiqueta del nodo --> N0 o N1 o N2 ...
                 node_to_index_dic[node] = i
                 index_to_node_lst.append(node)
                 
@@ -74,12 +85,16 @@ class Defo_results:
             for line in fd:
                 if (not line.startswith("Link_") and not line.startswith("edge_")):
                     continue
+                #Si llegamos aquí es porque estamos en una línea que contiene info sobre un enlace concreto de red
+                #Vamos a considerar únicamente, de los elementos 'label src dest weight bw delay' --> src dest weight bw
                 camps = line.split(" ")
-                src = int(camps[1])
-                dst = int(camps[2])
-                weight = int(camps[3])
-                bw = float(camps[4])
-                self.Gbase.add_edge(src, dst)
+                src = int(camps[1]) #Posición del nodo origen del enlace dirigido
+                dst = int(camps[2]) #Posición del nodo destino del enlace dirigido
+                weight = int(camps[3]) #Peso del enlace dirigido
+                bw = float(camps[4]) #Capacidad del enlace
+                self.Gbase.add_edge(src, dst) #Rellenamos el grafo dirigido pasando directamente los enlaces que lo conforman, indicando para cada enlace las posiciones de los nodos que reflejan los extremos del enlace
+                #Si no existen los nodos que conectan dicho enlace, se creará automáticamente dentro del digrafo
+                #Almacenamos en el diccionario links_bw --> CLAVE que refleja el enlace dirigido, y VALOR : capacidad del enlace
                 self.links_bw[src][dst] = bw
                 self.links_weight[src][dst] = weight
         self.node_to_index_dic_pvt = node_to_index_dic

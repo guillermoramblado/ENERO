@@ -22,7 +22,11 @@ class Env16(gym.Env):
     Environment used in the middlepoint routing problem. Here we compute the SP to reach a middlepoint.
     We are using bidirectional links in this environment!
     In this environment we make the MP between edges.
-    self.edge_state[:][0] = link utilization
+
+    #Realmente, [0] almacena el ancho de banda que está alojando actualmente el enlace, no su uso.
+    #Para obtener realmente el uso, será necesario dividir [0]/[1]
+    self.edge_state[:][0] = link utilization 
+
     self.edge_state[:][1] = link capacity
     self.edge_state[:][2] = bw allocated (the one that goes from src to dst)
     """
@@ -40,16 +44,22 @@ class Env16(gym.Env):
 
         # Nx Graph where the nodes have features. Betweenness is allways normalized.
         # The other features are "raw" and are being normalized before prediction
-        self.first = None
+        self.first = None #Tensor unidimensional con las posiciones de los enlaces mensajeros
         self.firstTrueSize = None
-        self.second = None
+        self.second = None #Tensor unidimensional con las posiciones de los enlaces receptores
         self.between_feature = None
 
         self.percentage_demands = None # X% of the most loaded demands we use for optimization
         self.shufle_demands = False # If True we shuffle the list of traffic demands
         self.top_K_critical_demands = False # If we want to take the top X% of the 5 most loaded links
-        self.num_critical_links = 5
+        self.num_critical_links = 5 #Los primeros X enlaces de mayor uso de los que tomaremos todas las demandas que pasen por ellos
 
+        '''
+        sp_middlepoints es un diccionario que contiene:
+            * Clave: demanda, es decir --> origen:destino
+            * Valor asociado: id del nodo de desvío
+        Si un cierta demanda no existe en este diccionario, es porque no se está aplicando actualmente ningún desvío para dicha demanda.
+        '''
         self.sp_middlepoints = None # For each src,dst we store the nodeId of the sp middlepoint
         self.shortest_paths = None # For each src,dst we store the shortest path to reach d
         self.sp_middlepoints_step = dict() # We store the midlepoint assignation before step() finishes
@@ -77,12 +87,13 @@ class Env16(gym.Env):
         self.K = None
         self.nodes = None # List of nodes to pick randomly from them
         self.ordered_edges = None
+        #Diccionario que almacena, para cada enlace 'i:j', su posición en comparación al resto de enlaces
         self.edgesDict = dict() # Stores the position id of each edge in order
         self.previous_path = None
 
         self.src_dst_k_middlepoints = None # For each src, dst, we store the k middlepoints
         self.list_eligible_demands = None # Here we store those demands from DEFO that have one middlepoint. These demands are going to be eligible by our DRL agent.
-        self.link_capacity_feature = None
+        self.link_capacity_feature = None #Almacena la capacidad de cada enlace en relación a la capacidad del enlace de mayor capacidad
 
         self.numNodes = None
         self.numEdges = None
@@ -110,7 +121,9 @@ class Env16(gym.Env):
     def add_features_to_edges(self):
         incId = 1
         for node in self.graph:
+            #Recorremos las claves del diccionario asociado a dicho nodo 'node', con claves --> posiciones de los nodos vecinos
             for adj in self.graph[node]:
+                #Trabajamos con un solo enlace dirigido de 'node' a 'adj', por lo que self.graph[node][adj] será un diccionario con una sola clave --> índice del único enlace dirigido (índice 0)
                 if not 'betweenness' in self.graph[node][adj][0]:
                     self.graph[node][adj][0]['betweenness'] = 0
                 if not 'edgeId' in self.graph[node][adj][0]:
@@ -163,7 +176,17 @@ class Env16(gym.Env):
                     # Remove paths not needed
                     del self.allPaths[str(n1)+':'+str(n2)][path:len(self.allPaths[str(n1)+':'+str(n2)])]
                     gc.collect()
-    
+
+
+    '''
+    Este método será usado cada vez que querramos cambiar la ruta a seguir para llevar el tráfico desde init_source a final_destination, y suponiendo
+    que la ruta actual ya está usando un middlepoint para seguir un desvío. En ese caso, tendremos que hacer lo siguiente:
+        * Primero decrementar el uso de los enlaces que cruzamos para ir desde el nodo origen hasta el middlepoint
+            Aquí src=nodo origen y dst=middlepoint
+        * Segundo, decrementar el uso de los enlaces que definen la ruta a seguir para ir desde el middlepoint hasta el nodo final
+            Aqúi src=middlepoint y dst=nodo final
+    En resumen, nos permite eliminar un middlepoint usado para una determinada pareja de nodos.
+    '''
     def decrease_links_utilization_sp(self, src, dst, init_source, final_destination):
         # In this function we desallocate the bandwidth by segments. This funcion is used when we want
         # to desallocate from a src to a middlepoint and then from middlepoint to a dst using the sp
@@ -185,18 +208,34 @@ class Env16(gym.Env):
             i = i + 1
             j = j + 1
 
+    '''
+    Este método recibe como parámetro la lista de tuplas '(uso enlace, inicio enlace, final enlace)' o enlaces de mayor uso seleccioandos (los 'K' primeros).
+    Las demandas críticas serán aquellas demandas que pasan por cualquiera de los K enlaces de mayor uso. Sobre esas demandas críticas, nos quedaremos con un porcentaje de ellas.
+    Entonces, para cada enlace de mayor uso:
+        * Tomamos las demandas que cruzan por dicho enlace
+    Sobre el total de demandas críticas, ordenamos por ancho de banda y seleccionamos un porcentaje de ellas.
+    
+    El entorno posee un atributo 'list_eligible_demands' que almacena una lista de tuplas (origen,destino,ancho de banda). Esto es, guarda las demandas
+    seleccionadas como críticas
+    '''
     def _get_top_k_critical_flows(self, list_ids):
         self.list_eligible_demands.clear()
         for linkId in list_ids:
-            i = linkId[1]
+            #Para cada enlace (ancho de banda que transcurre por el, nodo origen, nodo destino)
+            #Tomamos los nodos que están conectados mediante dicho enlace
+            i = linkId[1] 
             j = linkId[2]
+            #Recorremos las demandas que cruzan por dicho enlace
+            #Accedemos al primer y único enlace dirigido i -> j, y tomamos la característica 'crossing_paths', que nos devuelve un diccionario de parejas (demanda (= origen:destino), tráfico a enviar)
             for demand, value in self.graph[i][j][0]['crossing_paths'].items():
                 src, dst = int(demand.split(':')[0]), int(demand.split(':')[1])
+                #Puede ser que esta demanda pase por otro de los enlaces seleccionados y ya se haya almacenado
                 if (src, dst, self.TM[src,dst]) not in self.list_eligible_demands:  
                     self.list_eligible_demands.append((src, dst, self.TM[src,dst]))
-
+        #Ya hemos tomado las demandas que cruzan pos los k enlaces de mayor uso. Ahora ordenamos por ancho de banda (de mayor a menor)
         self.list_eligible_demands = sorted(self.list_eligible_demands, key=lambda tup: tup[2], reverse=True)
         if len(self.list_eligible_demands)>int(np.ceil(self.numNodes*(self.numNodes-1)*self.percentage_demands)):
+            #Seleccionamos un porcentaje de ellas
             self.list_eligible_demands = self.list_eligible_demands[:int(np.ceil(self.numNodes*(self.numNodes-1)*self.percentage_demands))]
 
     def _generate_tm(self, tm_id):
@@ -217,6 +256,7 @@ class Env16(gym.Env):
         for src in range (0,self.numNodes):
             for dst in range (0,self.numNodes):
                 if src!=dst:
+                    #Guardamos las demandas de la matriz de tráfico candidatas a ser demandas críticas
                     self.list_eligible_demands.append((src, dst, self.TM[src,dst]))
                     # If we have a link between src and dst
                     if src in self.graph and dst in self.graph[src]:
@@ -234,6 +274,7 @@ class Env16(gym.Env):
             self.list_eligible_demands = self.list_eligible_demands[:int(np.ceil(len(self.list_eligible_demands)*self.percentage_demands))]
         elif not self.top_K_critical_demands:
             # If we want to take the x% bigger demands
+            #Ordenamos las demandas de la matriz de tráfico de mayor a menor tráfico
             self.list_eligible_demands = sorted(self.list_eligible_demands, key=lambda tup: tup[2], reverse=True)
             self.list_eligible_demands = self.list_eligible_demands[:int(np.ceil(len(self.list_eligible_demands)*self.percentage_demands))]
 
@@ -263,11 +304,15 @@ class Env16(gym.Env):
         dstPath = int(self.list_eligible_demands[path][1])
         self.patMaxBandwth = (srcPath, dstPath, int(self.list_eligible_demands[path][2]))
     
+    '''
+    Este método nos permite seleccionar la siguiente demanda crítica que se devolverá con el objetivo de reenrutarla
+    Tras invocar este método, se incrementa el iterador 'iter_list_elig_dem' de la lista, de forma que si volvemos a invocar a la función, se fijará la siguiente demanda crítica de la lista. 
+    '''
     def _obtain_demand(self):
         src = self.list_eligible_demands[self.iter_list_elig_demn][0]
         dst = self.list_eligible_demands[self.iter_list_elig_demn][1]
         bw = self.list_eligible_demands[self.iter_list_elig_demn][2]
-        self.patMaxBandwth = (src, dst, int(bw))
+        self.patMaxBandwth = (src, dst, int(bw)) #Guardamos la siguiente demanda de mayor ancho de ancho de banda a reenrutar
         self.iter_list_elig_demn += 1
     
     def get_value(self, source, destination, action):
@@ -475,6 +520,7 @@ class Env16(gym.Env):
                                         self.src_dst_k_middlepoints[str(n1)+':'+str(n2)].append(midd)
                                         repeated_actions.append(action_flags)
 
+    #Método que guarda la lista de nodos que conforman el camino más corto para cada pareja origen-destino, creando y guardando la info en shortest_paths.json
     def compute_SPs(self):
         diameter = nx.diameter(self.graph)
         self.shortest_paths = np.zeros((self.numNodes,self.numNodes),dtype=object)
@@ -488,6 +534,7 @@ class Env16(gym.Env):
                     if (n1 != n2):
                         allPaths[str(n1)+':'+str(n2)] = []
                         # First we compute the shortest paths taking into account the diameter
+                        #all_simple_paths recibe el grafo de Networkx, y la fuente de origen y destino, devolviendo la lista de caminos que podemos seguir para ir de uno a otro
                         [allPaths[str(n1)+':'+str(n2)].append(p) for p in nx.all_simple_paths(self.graph, source=n1, target=n2, cutoff=diameter*2)]                    # We take all the paths from n1 to n2 and we order them according to the path length
                         # sorted() ordena los paths de menor a mayor numero de
                         # saltos y los que tienen los mismos saltos te los ordena por indice
@@ -504,15 +551,19 @@ class Env16(gym.Env):
                 if (n1 != n2):
                     self.shortest_paths[n1,n2] = allPaths[str(n1)+':'+str(n2)]
         
+    '''
+    Cada enlace dirigido del grafo (i:j) enviará mensajes a todos los enlaces dirigidos que salgan del nodo 'j' o que entren al nodo 'j'
+    De esta forma: 
+        * Los enlaces emisores de mensajes se almacenan en 'first'
+        * Los enlaces receptores de mensajes se almacenan en 'second'
+    '''
     def _first_second(self):
-        # Link (1, 2) recibe trafico de los links que inyectan en el nodo 1
-        # un link que apunta a un nodo envía mensajes a todos los links que salen de ese nodo
         first = list()
         second = list()
 
         for i in self.graph:
             for j in self.graph[i]:
-                neighbour_edges = self.graph.edges(j)
+                neighbour_edges = self.graph.edges(j) #Obtenemos todos los enlaces dirigidos que salen o entran al nodo 'j'
                 # Take output links of node 'j'
 
                 for m, n in neighbour_edges:
@@ -523,10 +574,11 @@ class Env16(gym.Env):
         self.first = tf.convert_to_tensor(first, dtype=tf.int32)
         self.second = tf.convert_to_tensor(second, dtype=tf.int32)
 
+    #Nos permite especificar la topología de trabajo y las matrices de tráfico con las que podemos trabajar para dicha topología 
     def generate_environment(self, dataset_folder_name, graph_topology_name, EPISODE_LENGTH, K, X):
         self.episode_length = EPISODE_LENGTH
         self.graph_topology_name = graph_topology_name
-        self.dataset_folder_name = dataset_folder_name
+        self.dataset_folder_name = dataset_folder_name #Carpeta que contiene los datos de la topología (carpeta con matrices de tráfico, archivo con la especificación de la topología...)
         self.list_eligible_demands = list()
         self.iter_list_elig_demn = 0
         self.percentage_demands = X
@@ -541,7 +593,10 @@ class Env16(gym.Env):
         self.defoDatasetAPI = defoResults.Defo_results(graph_file,results_file)
         
         self.graph = self.defoDatasetAPI.Gbase
-        self.add_features_to_edges()
+        #Añadimos características a los enlaces insertados en el grafo dirigido
+        #Recordemos que podemos añadir más de un enlace dirigido del nodo A al nodo B. Por tanto, cuando creamos un primero, se identifica con la clave 0
+        #De esta forma, grafo[A][B] es un diccionario con claves 0,1 .... que identifican a los enlaces dirigidos que van de A a B, y valores las características de los nodos con claves 0,1...
+        self.add_features_to_edges() #Construye las características asociadas a cada enlace dirigido, usando como valor inicial 0
         self.numNodes = len(self.graph.nodes())
         self.numEdges = len(self.graph.edges())
         btwns = nx.edge_betweenness_centrality(self.graph)
@@ -550,11 +605,13 @@ class Env16(gym.Env):
         if self.K>self.numNodes:
             self.K = self.numNodes
 
+        #Mantenemos un array 2D de numpy (matriz) con 3 columnas para cada enlace dirigido
         self.edge_state = np.zeros((self.numEdges, 3))
         self.betweenness_centrality = np.zeros(self.numEdges) # Used in the fully connected
         self.shortest_paths = np.zeros((self.numNodes,self.numNodes),dtype="object")
 
         position = 0
+        #Procedemos a rellenar con los valores tomados del .graph e insertados en el grafo de Networkx las características previamente creados usando add_features_to_edges() 
         for i in self.graph:
             for j in self.graph[i]:
                 self.edgesDict[str(i)+':'+str(j)] = position
@@ -562,12 +619,14 @@ class Env16(gym.Env):
                 self.graph[i][j][0]['weight'] = self.defoDatasetAPI.links_weight[i][j]
                 if self.graph[i][j][0]['capacity']>self.maxCapacity:
                     self.maxCapacity = self.graph[i][j][0]['capacity']
-                self.edge_state[position][1] = self.graph[i][j][0]['capacity']
-                self.betweenness_centrality[position] = btwns[i,j]
+                self.edge_state[position][1] = self.graph[i][j][0]['capacity'] #Capacidad del único enlace dirigido que va del nodo 'i' al nodo 'j'
+                #self.betweenness_centrality[position] = btwns[i,j]
+                self.betweenness_centrality[position] = btwns.get((i, j), btwns.get((j, i), 0.0))  # Robusto
                 self.graph[i][j][0]['utilization'] = 0.0
                 self.graph[i][j][0]['crossing_paths'].clear()
                 position += 1
 
+        #Guardamos los enlaces emisores y receptores de mensajes
         self._first_second()
         self.firstTrueSize = len(self.first)
 
@@ -579,27 +638,40 @@ class Env16(gym.Env):
 
         self.compute_middlepoint_set_remove_rep_actions_no_loop()
 
+    #Método encargado de ejecutar una acción en el entorno actual
     def step(self, action, demand, source, destination):
         # Action is the middlepoint. Careful because it can also be action==destination if src,dst are connected directly by an edge
         self.episode_over = False
         self.reward = 0
 
         # We get the K-middlepoints between source-destination
+        #Obtenemos la lista de middepoints para dicha pareja origen-destino, y tomamos el middlepoint especificado en 'action'
         middlePointList = self.src_dst_k_middlepoints[str(source) +':'+ str(destination)]
         middlePoint = middlePointList[action]
 
         # First we allocate until the middlepoint
+        #Primero incrementamos el uso de los enlaces que hay que cruzar para ir desde origen hasta middlepoint
         self.allocate_to_destination_sp(source, middlePoint, source, destination)
         # If we allocated to a middlepoint that is not the final destination
+        #Puede ser que el middlepoint escogido sea el propio nodo destino, en caso de que el nodo origen esté relacionado directamente con un enlace al nodo destino. Lo comprobamos
         if middlePoint!=destination:
+            #Si el middlepoint seleccionado no es el propio nodo destino, hay que plasmar la segunda parte de la ruta: middlepoint - destino
             # Then we allocate from the middlepoint to the destination
             self.allocate_to_destination_sp(middlePoint, destination, source, destination)
             # We store that the pair source,destination has a middlepoint
+            #Guardamos el middlepoint usado para dicha pareja origen-destino
             self.sp_middlepoints[str(source)+':'+str(destination)] = middlePoint
         
         self.sp_middlepoints_step = self.sp_middlepoints
         
         # Find new maximum and minimum utilization link
+        '''
+        Ahora debemos actualizar el nuevo enlace de mayor uso. Para ello, se siguen varios pasos:
+            * Se guarda el uso del enlace de mayor uso actual, antes de actualizar el nuevo enlace de mayor uso.
+            * Actualizamos el enlace de mayor uso modelado mediante la variable 'edgeMaxUti' : (inicio,fin,uso)
+                - inicio y fin reflejan los extremos del enlace dirigido de mayor uso
+                - 'uso' refleja la utilización de dicho enlace modelado como inicio-fin (enlace dirigido que va de 'inicio' a 'fin')
+        '''
         old_Utilization = self.edgeMaxUti[2]
         self.edgeMaxUti = (0, 0, 0)
         for i in self.graph:
@@ -609,13 +681,14 @@ class Env16(gym.Env):
                 link_capacity = self.links_bw[i][j]
                 norm_edge_state_capacity = self.edge_state[position][0]/link_capacity
                 if norm_edge_state_capacity>self.edgeMaxUti[2]:
-                    self.edgeMaxUti = (i, j, norm_edge_state_capacity)
+                    self.edgeMaxUti = (i, j, norm_edge_state_capacity) #Se guarda una tupla con el enlace de mayor uso en la red, y su uso
          
         self.currentVal = -self.edgeMaxUti[2]
-
+        #Calculamos la recompensa de llevar a cabo dicha acción sobre dicho estado (diferencia de uso de los enlaces de mayor uso atiguo y nuevo)
         self.reward = np.around((old_Utilization-self.edgeMaxUti[2])*10,2)
 
-        # If we didn't iterate over all demands 
+        # If we didn't iterate over all demands
+        #Si quedan demandas críticas por reenrutar, configuramos el entorno para que seleccione internamente la siguiente.
         if self.iter_list_elig_demn<len(self.list_eligible_demands):
             self._obtain_demand()
         else:
@@ -626,35 +699,59 @@ class Env16(gym.Env):
             self.episode_over = True
 
         # Remove bandwidth allocated until the middlepoint and then from the middlepoint on
+        '''
+        sp_middlepoints es un diccionario [origen:destino] (clave) -> [id_middlepoint usado] (valor)
+        Tras asignar un middlepoint a la demanda correspondiente, se procederá a eliminar la ruta actual que sigue patMaxBandwth, que representa
+        la siguiente demanda crítica a tratar (fijada en el  método previo _obatin_demand).
+        '''
         if str(self.patMaxBandwth[0])+':'+str(self.patMaxBandwth[1]) in self.sp_middlepoints:
+            #La siguiente demanda crítica a reenrutar ya tiene asignado un middlepoint
             middlepoint = self.sp_middlepoints[str(self.patMaxBandwth[0])+':'+str(self.patMaxBandwth[1])]
             self.decrease_links_utilization_sp(self.patMaxBandwth[0], middlepoint, self.patMaxBandwth[0], self.patMaxBandwth[1])
             self.decrease_links_utilization_sp(middlepoint, self.patMaxBandwth[1], self.patMaxBandwth[0], self.patMaxBandwth[1])
             del self.sp_middlepoints[str(self.patMaxBandwth[0])+':'+str(self.patMaxBandwth[1])] 
         else: # Remove the bandwidth allocated from the src to the destination
+            #No tiene asignado un middlepoint, por lo que la ruta es la más corta que va de origen a destino
             self.decrease_links_utilization_sp(self.patMaxBandwth[0], self.patMaxBandwth[1], self.patMaxBandwth[0], self.patMaxBandwth[1])
         
         # We desmark the bw_allocated
         self.edge_state[:,2] = 0
 
+        '''
+        Devolvemos, cada vez que el agente aplica una acción sobre el entorno (reenruta una cierta demanda):
+            * Recompensa obtenida (diferencia en el uso de los enlaces de mayor uso antiguo y nuevo)
+            * Si hemos terminado o no de reenrutar todas las demandas críticas seleccionadas
+            * Siempre que tras aplicar la acción, siga quedando al menos una demanda más que reenrutar, devuelve (ancho de banda, origen, destino) de la siguiente demanda a reenrutar
+            * Uso del enlace de mayor uso actual tras aplicar la acción
+        '''
         return self.reward, self.episode_over, 0.0, self.TM[self.patMaxBandwth[0]][self.patMaxBandwth[1]], self.patMaxBandwth[0], self.patMaxBandwth[1], self.edgeMaxUti, 0.0, np.std(self.edge_state[:,0])
 
+    '''
+    Método encargado de reiniciar el entorno:
+        * Se resetea el entorno, usando una matriz de tráfico diferente (es decir, cambiando el ancho de banda a envíar) pero manteniendo el msimo enrutamiento
+        * Se devuelve la demanda crítica de mayor ancho de banda que es necesaria reenrutar, eliminando claramente el ancho de banda de dicha demanda
+          de los enlaces que constituyen el camino que seguía el tráfico asociado a esa demanda.
+    '''
     def reset(self, tm_id):
         """
         Reset environment and setup for new episode. 
         Generate new TM but load the same routing. We remove the path with more bandwidth
         from the link with more utilization to later allocate it on a new path in the act().
         """
+        #Cambiamos la matriz de tráfico, esto es, el ancho de banda de las diferentes demandas de tráfico
+        #Este método guarda las demandas enviadas para cada pareja de nodo en dicha matriz, y guarda las demandas de mayor ancho de banda
         self._generate_tm(tm_id)
 
         self.sp_middlepoints = dict()
 
         # For each link we store the total sum of bandwidths of the paths crossing each link without middlepoints
+        #Se vuelve a restablecer el ancho de banda de los enlaces, suponiendo de nuevo que la ruta inicial de cada demanda es la definida por OSPF
         self.compute_link_utilization_reset()
 
         # We iterate over all links in an ordered fashion and store the features to edge_state
         self.edgeMaxUti = (0, 0, 0)
         # This list is used to obtain the top K flows from the critical links
+        #Esta lista contiene tuplas con la info de todos y cada uno de los enlaces de la topología
         list_link_uti_id = list()
         for i in self.graph:
             for j in self.graph[i]:
@@ -663,14 +760,18 @@ class Env16(gym.Env):
                 self.edge_state[position][1] = self.graph[i][j][0]['capacity']
                 link_capacity = self.links_bw[i][j]
                 # We store the link utilization and the corresponding edge
+                #Guardamos tuplas de la forma (ancho de banda que transcurre por el enlace i-j, i, j)
                 list_link_uti_id.append((self.edge_state[position][0], i, j))
                 
-                norm_edge_state_capacity = self.edge_state[position][0]/link_capacity
-                if norm_edge_state_capacity>self.edgeMaxUti[2]:
+                norm_edge_state_capacity = self.edge_state[position][0]/link_capacity #Uso del enlace actual
+                if norm_edge_state_capacity>self.edgeMaxUti[2]: #Si el uso de dicho enlace es superior al uso del enlace de mayor uso...
                     self.edgeMaxUti = (i, j, norm_edge_state_capacity)
         
+        #Esto está inicialmente desactivado. Pero cuando instancie el entorno en train_Enero_3_top_script.py, lo activo --> para tomar así las demandas que pasan por los 5 enlaces de mayor uso
         if self.top_K_critical_demands:
+            #Tomamos los primeros K enlaces más congestionados (en cuanto a su uso)
             list_link_uti_id = sorted(list_link_uti_id, key=lambda tup: tup[0], reverse=True)[:self.num_critical_links]
+            #Pasamos al entorno la lista de los 'K' enlaces más congestionados.
             self._get_top_k_critical_flows(list_link_uti_id)
 
         self.currentVal = -self.edgeMaxUti[2]
@@ -679,39 +780,69 @@ class Env16(gym.Env):
         #self._obtain_path_more_bandwidth_rand_link()
         #self._obtain_path_from_set_rand()
         #self._obtain_demand_hill_climbing()
+        
+        #Fijamos en el entorno la siguiente demanda crítica de la lista de demandas críticas 'list_eligible_demands', almacenándose en 'patMaxBanwth': tupla (origen,destino,ancho de banda)
         self._obtain_demand()
 
         # Remove bandwidth allocated for the path with more bandwidth from the link with more utilization
+        #Como este método devuelve la siguiente demanda crítica a reenrutar, será necesario primero eliminar la ruta actual, desalojando el ancho de banda de los enlaces
+        #por lo que cruce la ruta actual.
         self.decrease_links_utilization_sp(self.patMaxBandwth[0], self.patMaxBandwth[1], self.patMaxBandwth[0], self.patMaxBandwth[1])
 
         # We desmark the bw_allocated
         self.edge_state[:,2] = 0
 
         return self.TM[self.patMaxBandwth[0]][self.patMaxBandwth[1]], self.patMaxBandwth[0], self.patMaxBandwth[1]
-            
+
+    '''
+    A diferencia del método 'mark_action_sp', este método nos permite aplicar realmente sobre el grafo un desvío a seguir, actualizando directamente el uso
+    de los enlaces de la ruta definida.
+    A la hora de decidir realizar un cierto desvío al enviar los datos origen-destino, este método debe ser invocado dos veces:
+        * Una primera vez para actualizar los enlaces del grafo que definen la ruta 'origen-middlepoint'
+        * Una segunda vez para lo mismo, en este caso, trabajando sobre los enlaces del camino que nos lleva del middlepoint al destino
+    '''
     def allocate_to_destination_sp(self, src, dst, init_source, final_destination): 
         # In this function we allocated the bandwidth by segments. This funcion is used when we want
         # to allocate from a src to a middlepoint and then from middlepoint to a dst using the sp
         bw_allocate = self.TM[init_source][final_destination]
+        #camino más corto para ir desde origen a 'dst', que será el nodo de desvío : lista de nodos a seguir
         currentPath = self.shortest_paths[src,dst]
         
         i = 0
         j = 1
-
+        #Actualizamos el uso de los enlaces que hay que cruzar en el camino src-dst (origen-middlepoint o middlepoint-destino)
         while (j < len(currentPath)):
             firstNode = currentPath[i]
             secondNode = currentPath[j]
 
+            #Actualizamos el objeto grafo en sí
             self.graph[firstNode][secondNode][0]['utilization'] += bw_allocate  
             self.graph[firstNode][secondNode][0]['crossing_paths'][str(init_source)+':'+str(final_destination)] = bw_allocate
+            #Actualizamos tb el vector de estados de los enlaces del grafo, que mantiene aparte el entorno
             self.edge_state[self.edgesDict[str(firstNode)+':'+str(secondNode)]][0] = self.graph[firstNode][secondNode][0]['utilization']
             i = i + 1
             j = j + 1
     
+    '''
+    Este método marca los enlaces que tenemos que cruzar si queremos realizar un desvío al envíar los datos de origen a destino.
+    Para marcar el camino a seguir, se seguirán los siguientes pasos:
+        * Se seleccionan los enlaces del camino a seguir
+        * Para cada uno de esos enlaces, se toma su vector de estado, y se asigna en la componente '2': uso del enlace considerando únicamente el ancho de banda de
+        la demanda que queremos enrutar realizando un cierto desvío. Esto nos permite tener en todos aquellos enlaces que definen el camino a seguir, cuanta de su capacidad
+        necesitamos para transferir ese ancho de banda.
+
+        Gracias a esto, podemos marcar el camino de forma "abstracta", sin toquetear el estado actual de los enlaces del grafo, es decir, sin plasmar realmente el camino.
+        Por esta razón, se evita tocar directamente el grafo en sí, toqueteando únicamente los vectores estado que mantiene el agente para cada enlace.
+    '''
     def mark_action_sp(self, src, dst, init_source, final_destination): 
         # In this function we mark the action in the corresponding edges of the SP between src,dst
+
+        #Tomamos el ancho de banda a enviar de origen a destino
         bw_allocate = self.TM[init_source][final_destination]
-        currentPath = self.shortest_paths[src,dst]
+
+        #Tomamos el camino mas corto para ir desde el nodo origen hasta el nodo intermedio de desvío 'dst'
+        #Esto devuelve una lista con el índice de los nodos del camino más corto
+        currentPath = self.shortest_paths[src,dst] 
         
         i = 0
         j = 1
@@ -719,7 +850,8 @@ class Env16(gym.Env):
         while (j < len(currentPath)):
             firstNode = currentPath[i]
             secondNode = currentPath[j]
-
+            #Almacenamos en cada uno de los enlaces a recorrer el uso pero considerando SOLO el ancho de banda de la demanda que queremos enrutar en este preciso momento.
+            #Realmente se marcan los enlaces para seguir ese desvío, pero indicando el uso del enlace considerando únicamente dicho desvío
             self.edge_state[self.edgesDict[str(firstNode)+':'+str(secondNode)]][2] = bw_allocate/self.edge_state[self.edgesDict[str(firstNode)+':'+str(secondNode)]][1]
             i = i + 1
             j = j + 1

@@ -63,6 +63,8 @@ def old_cummax(alist, extractor):
             cummaxes.append(tf.math.add_n(maxes[0:i + 1]))
     return cummaxes
 
+
+#Clase que contiene el actor del agente DRL ya entrenado
 class PPOMIDDROUTING_SP:
     def __init__(self, env_training):
         self.listQValues = None
@@ -159,30 +161,50 @@ class PPOMIDDROUTING_SP:
 
         return inputs
 
+'''
+Este método permite aplicar el agente DRL sobre una cierta topología  y una cierta matriz de tráfico:
+    * tm_id --> matriz de tráfico de la red
+    * env_middRout_sp --> entorno de trabajo
+    * agent --> agente DLR entrenado que se usará para reenrutar cada demanda de la matriz
+'''
 def play_middRout_games_sp(tm_id, env_middRout_sp, agent, timesteps):
+    #Reseteamos el entorno usando una matriz de tráfico concreta, obteniendo la primera demanda a enrutar
     demand, source, destination = env_middRout_sp.reset(tm_id)
     rewardAddTest = 0
 
     initMaxUti = env_middRout_sp.edgeMaxUti[2]
     OSPF_init = initMaxUti
+    '''
+    Inicialmente, se supone que la ruta que va a seguir cada demanda es la definida por el protocolo OSPF, es decir, la ruta más corta
+    Por ende, inicialmente, el mejor enrutamiento es la ruta inicial de cada demanda.
+    La forma de tomar el mejor enrutamiento encontrado para cada demanda es simplemente tomando el middlepoint usado como desvío.
+    '''
+    #Inicialmente, el middlepoint que usa cada demanda es el propio nodo destino (es decir, inicialmente no se realiza ningún desvío)
     best_routing = env_middRout_sp.sp_middlepoints_step.copy()
 
+    #Tomamos la lista de demandas críticas seleccionadas para re-enrutar
     list_of_demands_to_change = env_middRout_sp.list_eligible_demands
     timesteps.append((0, initMaxUti))
 
     start = tt.time()
     time_start_DRL = start
     while 1:
+        #Usamos el actor para obtener las probabilidades de aplicar cada posible desvío dada esa demanda concreta
         action_dist, tensor = agent.pred_action_node_distrib_sp(env_middRout_sp, source, destination)
+        #Seleccionamos el desvío más probable
         action = np.argmax(action_dist)
-        
+        #Avanzamos en el entorno llevando a cabo la accíon (desvío) seleccionado para dicha demanda 
         reward, done, error_eval_links, demand, source, destination, maxLinkUti, minLinkUti, utiStd = env_middRout_sp.step(action, demand, source, destination)
         rewardAddTest += reward
+        #Si al reenrutar la demanda actual, el uso del nuevo enlace de mayor uso es inferior al uso del enlace de mayor uso antiguo
         if maxLinkUti[2]<initMaxUti:
-            initMaxUti = maxLinkUti[2]
+            initMaxUti = maxLinkUti[2] 
+            #Guardamos el enrutamiento actual de todas las demandas críticas
             best_routing = env_middRout_sp.sp_middlepoints_step.copy()
+            #Guardo el uso del enlace de mayor uso actual, que hemos logrado mejorar
             timesteps.append((tt.time()-time_start_DRL, initMaxUti))
         if done:
+            #Tras reenrutar todas las demandas críticas seleccionadas, salimos.
             break
     end = tt.time()
     return initMaxUti, end-start, OSPF_init, best_routing, list_of_demands_to_change, time_start_DRL
@@ -316,8 +338,12 @@ class HILL_CLIMBING:
 
     def get_value_sp(self, env, source, destination, action):
         # We get the K-middlepoints between source-destination
+        #Obtenemos el nodo de desvío que nos indica dicha acción
         middlePointList = list(env.src_dst_k_middlepoints[str(source) +':'+ str(destination)])
         middlePoint = middlePointList[action]
+
+
+        #Alojamos el ancho de banda de la demanda source:destination en los enlaces que definen el camino source-middlepoint y middlepont-destination
 
         # First we allocate until the middlepoint
         env.allocate_to_destination_sp(source, middlePoint, source, destination)
@@ -328,7 +354,8 @@ class HILL_CLIMBING:
             # We store that the pair source,destination has a middlepoint
             env.sp_middlepoints[str(source)+':'+str(destination)] = middlePoint
         
-        currentValue = -1000000
+        #Procedemos a calcular el uso del nuevo enlace de mayor uso en la red, tras aplicar dicho desvío 
+        currentValue = -1000000 
         position = 0
         # Get the maximum loaded link and it's value after allocating to the corresponding middlepoint
         for i in env.graph:
@@ -373,6 +400,7 @@ class HILL_CLIMBING:
                             # Remove the bandwidth allocated from the src to the destination
                             env.decrease_links_utilization_sp(source, dest, source, dest)
 
+                        #Obtenemos la puntuación de aplicar dicha acción (desvío) para dicha demanda ---> uso del enlace de mayor uso en caso de aplicar ese desvío (y tomandolo en NEGATIVO)
                         evalState = self.get_value_sp(env, source, dest, action)
                         if evalState > nextVal:
                             nextVal = evalState
@@ -397,6 +425,15 @@ class HILL_CLIMBING:
         nextVal = -1000000
         next_state = None
 
+        '''
+        Procedemos a recorrer, para cada demanda seleccionada, cada uno de los posibles desvíos a usar, dada dicha demanda.
+
+        Al final del for, y tras recorrer todas las acciones de todas las demandas de trabajo, obtendremos una tupla next_state : (action,source,dest)
+            * Esta tupla almacena información sobre la demanda para la que se ha localizado el mejor uso del enlace de mayor uso aplicando cierta acción
+        
+        De esta forma, en cada iteración del algoritmo de búsqueda local --> se recorren todas las demandas y todas las acciones, y se aplica (al final de la iteración) un cambio local, escogiendo una demanda concreta, y aplicando un desvío concreto.
+        '''
+
         # We iterate over the top critical demands
         for elem in env.list_eligible_demands:
             source = elem[0]
@@ -405,7 +442,9 @@ class HILL_CLIMBING:
                 middlepoint = -1
                 # First we need to desallocate the current demand before we explore all it's possible actions
                 # Check if there is a middlepoint to desallocate from src-middlepoint-dst
-                if str(source)+':'+str(dest) in env.sp_middlepoints:
+
+                #Comprobamos si actualmente dicha demanda sigue o no un cierto desvío
+                if str(source)+':'+str(dest) in env.sp_middlepoints: 
                     middlepoint = env.sp_middlepoints[str(source)+':'+str(dest)] 
                     env.decrease_links_utilization_sp(source, middlepoint, source, dest)
                     env.decrease_links_utilization_sp(middlepoint, dest, source, dest)
@@ -415,10 +454,12 @@ class HILL_CLIMBING:
                     # Remove the bandwidth allocated from the src to the destination
                     env.decrease_links_utilization_sp(source, dest, source, dest)
 
+                #Obtenemos la puntuación de aplicar dicha acción (desvío) para dicha demanda ---> uso del enlace de mayor uso en caso de aplicar ese desvío (y tomandolo en NEGATIVO)
                 evalState = self.get_value_sp(env, source, dest, action)
+                #Esta acción nos permite obtener un uso del enlace de mayor uso correspondiente menor que el obtendríamos aplicando hasta el momento la mejor acción
                 if evalState > nextVal:
                     nextVal = evalState
-                    next_state = (action, source, dest)
+                    next_state = (action, source, dest) 
                 
                 # Allocate back the demand whose actions we explored
                 # If the current demand had a middlepoint, we allocate src-middlepoint-dst
@@ -447,6 +488,7 @@ def play_sp_hill_climbing_games(tm_id):
         nextVal, next_state = hill_climb_agent.explore_neighbourhood_sp(env_hill_climb)
         # If the difference between the two edges is super small but non-zero, we break (this is because of precision reasons)
         if nextVal<=currentVal or (abs((-1)*nextVal-(-1)*currentVal)<1e-4):
+            #Salimos cuando tras
             break
         
         # Before we apply the new action, we need to remove the current allocation of the chosen demand
@@ -476,10 +518,13 @@ def play_DRL_GNN_sp_hill_climbing_games(tm_id, best_routing, list_of_demands_to_
     env_hill_climb.seed(SEED)
     env_hill_climb.generate_environment(general_dataset_folder, graph_topology_name, EPISODE_LENGTH_MIDDROUT, NUM_ACTIONS, percentage_demands)
 
+    #Uso del enlace de mayor uso actual para el estado del entorno, pero en NEGATIVO
     currentVal = env_hill_climb.reset_DRL_hill_sp(tm_id, best_routing, list_of_demands_to_change)
     hill_climb_agent = HILL_CLIMBING(env_hill_climb)
     start = tt.time()
     while 1:
+        #Seleccionamos la demanda cuya ruta se va a cambiar y la acción (desvío) a aplicar
+        #Obtenemos nextVal: uso del enlace de mayor uso aplicando la acción indicada en next_state a la demanda asociada a next_state, dicho uso en NEGATIVO
         nextVal, next_state = hill_climb_agent.explore_neighbourhood_DRL_sp(env_hill_climb)
         # If the difference between the two edges is super small but non-zero, we break (this is because of precision reasons)
         if nextVal<=currentVal or (abs((-1)*nextVal-(-1)*currentVal)<1e-4):
@@ -502,6 +547,7 @@ def play_DRL_GNN_sp_hill_climbing_games(tm_id, best_routing, list_of_demands_to_
             env_hill_climb.decrease_links_utilization_sp(source, dest, source, dest)
         
         # We apply the new chosen action to the selected demand
+        #Aplicamos la acción y demanda seleccionadas en esta iteración del algoritmo de búsqueda local
         currentVal = env_hill_climb.step_hill_sp(action, source, dest)
         timer = tt.time()
         timesteps.append((timer-time_start_DRL, currentVal*(-1)))
@@ -572,6 +618,7 @@ def play_middRout_games(tm_id, env_middRout, agent):
 
 
 if __name__ == "__main__":
+    #Este script recibirá como parámetro, entre otros, el id de la mejor versión del modelo
     # Parse logs and get best model
     parser = argparse.ArgumentParser(description='Parse file and create plots')
 
@@ -602,8 +649,10 @@ if __name__ == "__main__":
     # Set to True f we want to take the top X% of the 5 most loaded links
     env_DRL_SP.top_K_critical_demands = True
 
+    #Instanciamos el agetne DRL y restablecemos los valores de los parámetros del actor, usando la mejor versión encontrada en el proceso de entrenamiento ya realizado
     DRL_SP_Agent = PPOMIDDROUTING_SP(env_DRL_SP)
-    checkpoint_dir = "./models" + differentiation_str
+    #checkpoint_dir = "./models" + differentiation_str
+    checkpoint_dir = "modelsEnero_3top_15_B_NEW"
     checkpoint = tf.train.Checkpoint(model=DRL_SP_Agent.actor, optimizer=DRL_SP_Agent.optimizer)
     # Restore variables on creation if a checkpoint exists.
     checkpoint.restore(checkpoint_dir + "/ckpt_ACT-" + str(model_id))
@@ -614,39 +663,78 @@ if __name__ == "__main__":
     # We can also use simulated annealing but it is going to take a while
     max_link_uti_sim_annealing, optim_cost_SA = 1,1 #play_sp_simulated_annealing_games(tm_id)
     
+    #Aplicamos únicamente el algoritmo de búsqueda local, que en cada iteracón, irá realizando un cambio local (cambio que afecta únicamente a una sola demanda) hasta que no mejore el uso del nuevo enlace de mayor congestión
+    '''
+    Se obtiene como salida:
+        * Uso del enlace de mayor uso del estado final en el que queda la red tras aplicar el algoritmo de busqueda local
+        * Tiempo de ejecución de dicho algoritmo
+    '''
     max_link_uti_sp_hill_climb, optim_cost_HILL = play_sp_hill_climbing_games(tm_id)
     
     max_link_uti_SAP, optim_cost_SAP = 1, 1 #play_sap_games(tm_id)
     
+    '''
+    Aplicamos el agente DLR inicialmente para reenrutar todas las demandas críticas seleccionadas de la matriz de tráfico correspondiente, dada dicha topología
+    Devuelve:
+        * max_link_uti_DRL_SP : uso del enlace de mayor uso, tras reenrutar todas las demandas críticas considerando dicha matriz de tráfico
+        * optim_cost_DRL_GNN :  tiempo que ha tardado el agente en reenrutar todas las demandas críticas
+        * OSPF_init --> uso del enlace de mayor uso del estado inicial de la red, antes de reenrutar las demandas usando el agente y aplciar posteriormente LS
+        * best_routing --> lista con el desvío aplicado para cada demanda crítica, tomando el mejor enrutamiento conseguido tras aplicar el agente DRL sobre todas las demandas críticas dada dicha matriz y dada dicha topología
+        * list_of_demands_to_change --> demandas críticas seleccionadas para reenrutar por el agente
+        * time_start_DRL --> Instante de tiempo en el que se inició el agente DRL
+    '''
     max_link_uti_DRL_SP, optim_cost_DRL_GNN, OSPF_init, best_routing, list_of_demands_to_change, time_start_DRL = play_middRout_games_sp(tm_id, env_DRL_SP, DRL_SP_Agent, timesteps)
-    
+    #Posteriormente, intentamos mejorar la solución usando un algoritmo de búsqueda local : HILL CLIMBING
+    '''
+    Obtenemos como parámetros de salida:
+        * Uso del enlace de mayor uso sobre el estado final en el que queda la red tras aplicar el algoritmo de búsqueda local
+        * Tiempo de ejecución del LS
+    '''
     max_link_uti_DRL_SP_HILL, optim_cost_DRL_HILL = play_DRL_GNN_sp_hill_climbing_games(tm_id, best_routing, list_of_demands_to_change, timesteps, time_start_DRL)
 
     new_timesteps = list()
+    '''
+    timesteps guarda:
+    * Cuando aplicamos inicialmente el agente DRL: se almacena una tupla cada vez que el agente reenruta una demanda crítica y la métrica mejora. Dicha tupla contiene (tiempo total necesario para conseguir dicha mejora (desde que se inició el agente), uso obtenido)
+    * Cuando aplicamos LS: cada vez que el algoritmo aplica una acción sobre el entorno, independientemente de que haya mejora o no, se guarda una tupla con lo mismo (tomando como t_0 el instante en el que se inició el agente, no LS)
+    '''
     for elem in timesteps:
         new_timesteps.append((elem[0], elem[1], time_start_DRL, max_link_uti_DRL_SP))
 
+    #Se imprime por pantalla el uso del enlace de mayor uso inicial de la red, y el uso tras aplicar AGENTE DRL + LS, junto con la matriz de tráfico considerada
     print("MAX UTI before and after optimization for traffic matrix ID: ", OSPF_init, max_link_uti_DRL_SP_HILL, tm_id)
 
-    results[3] = max_link_uti_DRL_SP_HILL 
+    results[3] = max_link_uti_DRL_SP_HILL #Uso del enlace de mayor uso del estado final de la red tras aplicar ENERO
     results[4] = max_link_uti_sim_annealing
     results[6] = len(env_DRL_SP.defoDatasetAPI.Gbase.edges()) # We store the number of edges to order the figures
-    results[7] = max_link_uti_sp_hill_climb
-    results[8] = max_link_uti_SAP
-    results[9] = max_link_uti_DRL_SP
+    results[7] = max_link_uti_sp_hill_climb #Uso del enlace de mayor uso del estado final de la red tras aplicar únicamente  LS
+    results[8] = max_link_uti_SAP #NO SE USA
+    results[9] = max_link_uti_DRL_SP #Uso del enlace de mayor uso del estado final de la red tras aplicar únicamente primero el agente
     results[11] = OSPF_init
     results[12] = optim_cost_SA
-    results[13] = optim_cost_SAP
-    results[14] = optim_cost_DRL_GNN
-    results[15] = optim_cost_HILL
-    results[16] = optim_cost_DRL_GNN+optim_cost_DRL_HILL
+    results[13] = optim_cost_SAP #NO SE USA
+    results[14] = optim_cost_DRL_GNN #Tiempo total de ejecución del agente para reenrutar todas las demandas críticas del agente
+    results[15] = optim_cost_HILL #Tiempo total de ejecución del algoritmo LS
+    results[16] = optim_cost_DRL_GNN+optim_cost_DRL_HILL #Tiempo total de ENERO (Agente DRL + LS)
 
+    #Así ,results[3], results[7] y results[9] nos permiten comparar ENERO - agente DRL - algoritmo LS
+
+    '''
+    Esto sería la concatenación de :
+        * drl_eval_res_folder: ../ENERO_datasets/dataset_sing_top/data/results_my_3_tops_unif_05-1/evalRes_NEW_Garr199905/EVALUATE/
+        * differentiation_str: SP_3top_15_B_NEW
+        * graph_topology_name: nombre de la topologia
+    '''
     path_to_pckl_rewards = drl_eval_res_folder + differentiation_str+ '/'+ graph_topology_name + '/'
     if not os.path.exists(path_to_pckl_rewards):
         os.makedirs(path_to_pckl_rewards)
 
+    #Guardamos los resultados de evaluación en una matriz de tráfico concreta para esa topología de trabajo, usando dos archivos de extensiones '.pckl' y '.timesteps'
+    #Esos dos archivos tendrán como sufijo --> el ID de la matriz de tráfico considerada
     with open(path_to_pckl_rewards + graph_topology_name +'.' + str(tm_id) + ".pckl", 'wb') as f:
         pickle.dump(results, f, pickle.HIGHEST_PROTOCOL)
     
     with open(path_to_pckl_rewards + graph_topology_name +'.' + str(tm_id) + ".timesteps", 'w') as fp:
         json.dump(new_timesteps, fp)
+
+    print(f'Finalizada la evaluación en la matriz {tm_id} de la topología {graph_topology_name}')
